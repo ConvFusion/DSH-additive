@@ -1,0 +1,14 @@
+# dsh-additive — default configuration.
+#
+# Host-persisted fields (Settings → Additive):
+#   inputHistoryEnabled  ↑/↓ history navigation in the chat composer
+#
+# Note: the custom logo / brand name are intentionally NOT here — they are
+# client-local (browser localStorage), and uploaded logo images are stored
+# on the host disk under the DSH home (~/.dsh/dsh-additive/) and served at
+# /dsh-additive/logo.
+- insert:
+    - id: additive
+      name: dsh-additive
+      config:
+        inputHistoryEnabled: false

@@ -1,0 +1,12 @@
+# dependencies
+node_modules/
+
+# build output (dsh-additive: `npm run build` regenerates)
+dsh-additive/lib/
+
+# OS / editor cruft
+.DS_Store
+*.log
+
+# pnpm local store (sandbox falls back to project-local store)
+.pnpm-store/
