@@ -2,6 +2,9 @@
 #
 # Host-persisted fields (Settings → Additive):
 #   inputHistoryEnabled  ↑/↓ history navigation in the chat composer
+#   workspaceDir         workspace directory whose AGENTS.local.md the
+#                        settings editor edits (empty → first registered
+#                        workspace)
 #
 # Note: the custom logo / brand name are intentionally NOT here — they are
 # client-local (browser localStorage), and uploaded logo images are stored
@@ -12,3 +15,4 @@
       name: dsh-additive
       config:
         inputHistoryEnabled: false
+        workspaceDir: ''

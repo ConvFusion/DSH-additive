@@ -8,8 +8,13 @@ DSH 界面增强插件（`~/.dsh/profiles/web` 本地 link 安装）：
    （深色药丸）。可上传本地图片覆盖（文件存磁盘 `~/.dsh/dsh-additive/`，引用存
    浏览器 localStorage）、改品牌名、改版本号；保存实时生效。
 2. **输入框 ↑/↓ 历史回溯** — 类终端 readline 行为，配置开关控制启用。
+3. **AGENTS 指令文件编辑** — 在设置里用**一个下拉框**选择要编辑的文件（第 1 项是
+   全局 `$DSH_HOME/AGENTS.md`，即默认 `~/.dsh/AGENTS.md`、Windows 为
+   `%USERPROFILE%\.dsh\AGENTS.md`；其后是各工作区的 `AGENTS.local.md`），
+   下方单个编辑器直接改内容，带路径显示、保存哈希冲突检测与原子写入。
 
-> 开发计划见仓库根目录 `plan_logo.md` / `plan_history_inputs.md`。
+> 开发计划见仓库根目录 `plan_logo.md` / `plan_history_inputs.md`；
+> 指令文件编辑的实现说明见 `dev-notes/instructions-editor.md`。
 
 ## 安装（本仓库开发方式，已配置完成）
 
@@ -53,6 +58,7 @@ npm run build       # tsc（host）+ esbuild（client bundle，lib/client.js）
 | `brandName` | string | 浏览器 localStorage | 空（保留官方 DeepSeek 标识 wordmark） | 品牌文字；自定义后替换 wordmark |
 | `brandVersion` | string | 浏览器 localStorage | `Launcher` | 品牌名后的深色版本徽章 |
 | `inputHistoryEnabled` | boolean | `~/.dsh/settings.yaml` | `false` | 输入框 ↑/↓ 历史回溯开关 |
+| `workspaceDir` | string | `~/.dsh/settings.yaml` | 空 → 取第一个已注册工作区 | 指令文件编辑器要编辑哪个工作区的 `AGENTS.local.md`（设置页选择后自动写入） |
 
 - **Logo/品牌名/版本**：客户端本地存储（localStorage，键 `dsh-additive:brand.*`），
   每次页面加载自动恢复；跨标签页通过 `storage` 事件同步。上传的图片文件写在
@@ -97,6 +103,36 @@ npm run build       # tsc（host）+ esbuild（client bundle，lib/client.js）
   （提取自 dsh-web-frontend 0.1.2-rc.1，`currentColor` 着色，字形逐像素一致）；
   徽章区域只由本插件的版本徽章占据，不再出现 HARNESS。
 
+### AGENTS 指令文件编辑
+
+- **加载方是谁**：指令文件由核心插件 `@deepseek-ai/dsh-agent-instructions`（`dsh-base`
+  默认启用）加载——全局 `$DSH_HOME/AGENTS.md`，以及项目链上的 `AGENTS.md` /
+  `CLAUDE.md` 与本地覆盖层 `AGENTS.local.md` / `CLAUDE.local.md`。
+- **为什么只做"编辑"**：该插件的候选文件名 / `dshHome` / 根标记只在 **composition 层**
+  （bundle、`cordis.patch.yml`）生效，**不读** `~/.dsh/settings.yaml`；settings
+  namespace 又由注册方插件独占，本插件无法替它注册。所以设置页提供的是官方缺失的
+  **内容编辑**入口，而不是"加载开关"。
+- **宿主路由**（同一 `/dsh-additive` 前缀）：
+  - `GET /dsh-additive/instructions[?workspace=<dir>]` — 返回两个文件的路径、内容、
+    `sha256`、字节数，以及工作区列表；
+  - `GET /dsh-additive/instructions/workspaces` — `ctx.workspaceRegistry.list()`
+    的工作区摘要（id/title/path/目录是否存在）；
+  - `POST /dsh-additive/instructions/global` — 写 `$DSH_HOME/AGENTS.md`；
+  - `POST /dsh-additive/instructions/local` — 写 `<workspaceDir>/AGENTS.local.md`。
+- **界面**：只有一个下拉框 + 一个编辑器（无说明段落）。下拉第 1 项是「全局指令（所有会话）」，
+  其余项为各工作区（值前缀 `workspace:`）；切换即读取对应文件，编辑器与保存/重新加载
+  始终作用于当前选中项。全局文件不属于任何工作区，因此不会被工作区选择影响。
+  编辑器上方只有一行：解析出的路径 + 状态（`已存在 · N 字节` / `尚不存在（保存即创建）`）。
+- **路径解析**：全局用 `resolveDshHome()`（显式配置 > `$DSH_HOME` > `os.homedir()/.dsh`），
+  因此 Windows 自然落在 `%USERPROFILE%\.dsh\AGENTS.md`；工作区取 `workspaceDir` 设置
+  （空则用第一个已注册工作区），文件名固定为 `AGENTS.local.md`，不做递归匹配。
+- **安全与一致性**：单文件 1 MiB 上限；只写上述两个文件；写工作区前要求目录存在
+  （全局会按需创建 home）；读返回的 `sha256` 作为保存时的 `baseSha256`，磁盘已被外部
+  修改则 **409** 并提示重新加载；写入走"同目录临时文件 + rename"原子替换，避免核心
+  插件读到半截内容。
+- **生效时机**：核心插件**没有 watcher**。新会话立即可见；当前会话在下次成功的
+  `read`/`write`/`edit`、会话 resume 对账，或重新进入 pre-step 时更新。
+
 ### 输入历史（DOM 事件 + 每输入框独立状态）
 
 - 捕获阶段监听 `document` 上的 `keydown` / `input` / `compositionstart/end`。
@@ -139,3 +175,15 @@ npm run build       # tsc（host）+ esbuild（client bundle，lib/client.js）
 - 需要权限仲裁的发送（adjudication 延迟清空输入框）可能漏入栈——
   常规聊天消息不受影响。
 - 多会话并存时（未来 Web 壳多面板）按输入框实例隔离，尚未做会话 id 映射。
+- 指令文件编辑只覆盖 `$DSH_HOME/AGENTS.md` 与所选工作区的 `AGENTS.local.md`：
+  `AGENTS.md` / `CLAUDE.md`、嵌套子目录的覆盖层仍需手工编辑或用 `read`/`edit` 工具改。
+- 保存冲突检测是"读时哈希 vs 保存时哈希"：命中即 409，不做自动合并（避免静默覆盖）。
+- `workspaceDir` 只接受已注册工作区的绝对路径；宿主未提供 `workspaceRegistry`
+  （非 Web 组合）时列表为空，需靠 `workspaceDir` 设置指定。
+
+## 自检
+
+```bash
+npm run build
+node scripts/smoke-instructions.mjs   # 25 项：路径解析 / 读写 / 哈希守卫 / 上限 / 路径边界
+```

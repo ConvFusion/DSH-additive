@@ -2,16 +2,22 @@
  * dsh-additive — host half.
  *
  * Registers:
- *   - the `additive` settings namespace (currently: the inputHistoryEnabled
- *     toggle; logo/brand references live in the browser's localStorage and
- *     need no host persistence)
+ *   - the `additive` settings namespace (inputHistoryEnabled, workspaceDir;
+ *     logo/brand references live in the browser's localStorage and need no
+ *     host persistence)
  *   - same-origin web routes for the local logo image:
  *       POST   /dsh-additive/logo  — upload (validated, written to disk)
  *       GET    /dsh-additive/logo  — serve the stored image
  *       DELETE /dsh-additive/logo  — remove the stored image
+ *   - same-origin web routes for editing the two AGENTS instruction files:
+ *       GET  /dsh-additive/instructions             — global + workspace file snapshots
+ *       GET  /dsh-additive/instructions/workspaces  — registered workspaces for the picker
+ *       POST /dsh-additive/instructions/global      — write $DSH_HOME/AGENTS.md
+ *       POST /dsh-additive/instructions/local       — write <workspace>/AGENTS.local.md
  *
  * The image bytes live under the DSH home (e.g. ~/.dsh/dsh-additive/); the
- * browser only ever sees the served path.
+ * browser only ever sees the served path. The instruction editor touches
+ * exactly two existing files (see ./instructions-store.ts) and nothing else.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type Context } from '@deepseek-ai/cordis'
@@ -24,6 +30,20 @@ import {
   MAX_LOGO_BYTES,
   type LogoStore,
 } from './logo-store.js'
+import {
+  inspectWorkspaceDir,
+  InstructionStoreError,
+  LOCAL_INSTRUCTION_FILE,
+  MAX_INSTRUCTION_BYTES,
+  pickWorkspaceDir,
+  readInstructionFile,
+  resolveGlobalInstructionPath,
+  resolveLocalInstructionPath,
+  writeInstructionFile,
+  type InstructionFileId,
+  type InstructionFileSnapshot,
+  type WorkspaceSummary,
+} from './instructions-store.js'
 
 export const name = 'dsh-additive'
 export { Config }
@@ -46,21 +66,24 @@ export function apply(ctx: Context, entry: Partial<ConfigShape> = {}): void {
     },
   })
 
-  void registerLogoRoutes(ctx)
+  void registerRoutes(ctx, () => source())
 
   ctx.logger?.info(
-    '[additive] 插件已加载：设置项「Additive」已注册（历史开关 + Logo 本地存储/上传）',
+    '[additive] 插件已加载：设置项「Additive」已注册（历史开关 + Logo 上传 + AGENTS 指令文件编辑）',
   )
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- * Logo file routes
+ * Web routes
+ *
+ * One prefix registration serves every `/dsh-additive/*` resource: the same
+ * origin and auth as the page, so the settings UI needs no extra transport.
  * ════════════════════════════════════════════════════════════════════════ */
 
-async function registerLogoRoutes(ctx: Context): Promise<void> {
+async function registerRoutes(ctx: Context, readConfig: () => ConfigShape): Promise<void> {
   const webServer = ctx.get('webServer')
   if (!webServer || typeof webServer.register !== 'function') {
-    ctx.logger?.info('[additive] webServer 服务不可用（非 Web 组合），跳过 logo 路由')
+    ctx.logger?.info('[additive] webServer 服务不可用（非 Web 组合），跳过 logo/指令路由')
     return
   }
   const store = await createLogoStore()
@@ -69,11 +92,19 @@ async function registerLogoRoutes(ctx: Context): Promise<void> {
     kind: 'prefix',
     path: '/dsh-additive',
     handler: (req: IncomingMessage, res: ServerResponse) => {
+      const pathname = new URL(req.url ?? '/', 'http://localhost').pathname.replace(/\/+$/, '') || '/'
+      if (pathname.startsWith('/dsh-additive/instructions')) {
+        void handleInstructionsRequest(req, res, readConfig, ctx).catch((error: unknown) => {
+          ctx.logger?.warn(`[additive] 指令文件请求处理失败: ${String(error)}`)
+          sendJson(res, 500, { ok: false, error: 'internal' })
+        })
+        return
+      }
       void handleLogoRequest(req, res, store, ctx.logger)
     },
   })
   ctx.logger?.info(
-    `[additive] logo 本地存储已就绪（${store.dir}），路由 ${LOGO_SERVED_PATH} 已注册`,
+    `[additive] logo 本地存储已就绪（${store.dir}），路由 ${LOGO_SERVED_PATH} 与 /dsh-additive/instructions* 已注册`,
   )
 }
 
@@ -149,6 +180,260 @@ export async function handleLogoRequest(
       return
     }
     logger?.warn(`[additive] logo 请求处理失败: ${String(error)}`)
+    sendJson(res, 500, { ok: false, error: 'internal' })
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Instruction-file routes (Settings → Additive → 指令文件)
+ *
+ * Reads and writes exactly two files: `$DSH_HOME/AGENTS.md` and
+ * `<workspaceDir>/AGENTS.local.md`. The core `agent-instructions` plugin owns
+ * *loading* them; this surface only edits their content, and the workspace
+ * directory comes from the `additive` settings namespace (or, when unset, the
+ * first registered workspace).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** Structural view of the host workspace registry (no compile-time import). */
+interface WorkspaceEntityLike {
+  id?: unknown
+  title?: unknown
+  path?: unknown
+}
+
+interface WorkspaceRegistryLike {
+  list(): WorkspaceEntityLike[]
+}
+
+interface InstructionsHostContext {
+  get(name: string): unknown
+  logger?: { info: (m: string) => void; warn: (m: string) => void }
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of req) {
+    total += (chunk as Buffer).length
+    // Content is capped at 1 MiB in the store; allow JSON escaping overhead.
+    if (total > MAX_INSTRUCTION_BYTES * 2 + 64 * 1024) {
+      throw new InstructionStoreError('too-large', 'request body exceeds the instruction-file limit')
+    }
+    chunks.push(Buffer.from(chunk as Uint8Array))
+  }
+  if (total === 0) return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    throw new InstructionStoreError('invalid-content', 'request body is not valid JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new InstructionStoreError('invalid-content', 'request body must be a JSON object')
+  }
+  return parsed as Record<string, unknown>
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+/** Read the registry as plain summaries; an absent registry yields an empty list. */
+async function listWorkspaces(ctx: InstructionsHostContext): Promise<WorkspaceSummary[]> {
+  const registry = ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+  if (!registry || typeof registry.list !== 'function') return []
+  let entities: WorkspaceEntityLike[]
+  try {
+    entities = registry.list()
+  } catch (error) {
+    ctx.logger?.warn(`[additive] 工作区列表读取失败: ${String(error)}`)
+    return []
+  }
+  const summaries: WorkspaceSummary[] = []
+  for (const entity of entities) {
+    const path = optionalString(entity.path)
+    if (path === undefined) continue
+    const id = optionalString(entity.id) ?? path
+    if (summaries.some((entry) => entry.id === id || entry.path === path)) continue
+    const { missingDir } = await inspectWorkspaceDir(path)
+    summaries.push({ id, title: optionalString(entity.title) ?? path, path, missingDir })
+  }
+  return summaries
+}
+
+/**
+ * Resolve both editable targets for one request.
+ * @returns the global and workspace snapshots, the effective workspace
+ * directory, and the workspace list for the picker.
+ */
+async function loadInstructionTargets(
+  ctx: InstructionsHostContext,
+  config: ConfigShape,
+  requestedWorkspace: string | undefined,
+): Promise<{
+  target: { global: InstructionFileSnapshot; local: InstructionFileSnapshot | null }
+  workspaceDir: string | undefined
+  workspaces: WorkspaceSummary[]
+}> {
+  const globalPath = resolveGlobalInstructionPath()
+  const workspaces = await listWorkspaces(ctx)
+  const workspaceDir = pickWorkspaceDir(
+    requestedWorkspace,
+    config.workspaceDir,
+    workspaces.map((entry) => entry.path),
+  )
+
+  const global = await readInstructionFile('global', globalPath.path, globalPath.displayPath)
+  let local: InstructionFileSnapshot | null = null
+  if (workspaceDir !== undefined && workspaceDir.length > 0) {
+    const canonical = await inspectWorkspaceDir(workspaceDir)
+    local = await readInstructionFile(
+      'local',
+      resolveLocalInstructionPath(canonical.path),
+    )
+  }
+  return { target: { global, local }, workspaceDir, workspaces }
+}
+
+async function writeTarget(
+  ctx: InstructionsHostContext,
+  config: ConfigShape,
+  id: InstructionFileId,
+  requestedWorkspace: string | undefined,
+  body: Record<string, unknown>,
+): Promise<InstructionFileSnapshot> {
+  const content = body['content']
+  if (typeof content !== 'string') {
+    throw new InstructionStoreError('invalid-content', 'body.content must be a string')
+  }
+  const baseSha256 = body['baseSha256']
+  if (baseSha256 !== undefined && baseSha256 !== null && typeof baseSha256 !== 'string') {
+    throw new InstructionStoreError('invalid-content', 'body.baseSha256 must be a string or null')
+  }
+  const guard = typeof baseSha256 === 'string' ? baseSha256 : null
+
+  if (id === 'global') {
+    const globalPath = resolveGlobalInstructionPath()
+    return await writeInstructionFile(
+      'global',
+      globalPath.path,
+      content,
+      { baseSha256: guard },
+      globalPath.displayPath,
+    )
+  }
+
+  const requested = requestedWorkspace ?? optionalString(body['workspace'])
+  const workspaces = await listWorkspaces(ctx)
+  const workspaceDir = pickWorkspaceDir(
+    requested,
+    config.workspaceDir,
+    workspaces.map((entry) => entry.path),
+  )
+  if (workspaceDir === undefined || workspaceDir.length === 0) {
+    throw new InstructionStoreError(
+      'not-found',
+      'no workspace directory selected; pick a workspace in Settings → Additive first',
+    )
+  }
+  const canonical = await inspectWorkspaceDir(workspaceDir)
+  if (canonical.missingDir) {
+    throw new InstructionStoreError(
+      'not-found',
+      `workspace directory "${canonical.path}" does not exist`,
+    )
+  }
+  return await writeInstructionFile(
+    'local',
+    resolveLocalInstructionPath(canonical.path),
+    content,
+    { baseSha256: guard, requireParent: true },
+  )
+}
+
+/** Route handler for `/dsh-additive/instructions*` (exported for tests). */
+export async function handleInstructionsRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  readConfig: () => ConfigShape,
+  ctx: InstructionsHostContext,
+): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const pathname = url.pathname.replace(/\/+$/, '') || '/'
+  const method = req.method ?? 'GET'
+  const config = readConfig()
+
+  try {
+    if (pathname === '/dsh-additive/instructions/workspaces') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      sendJson(res, 200, { ok: true, workspaces: await listWorkspaces(ctx) })
+      return
+    }
+
+    if (pathname === '/dsh-additive/instructions') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      const requested = url.searchParams.get('workspace') ?? undefined
+      const loaded = await loadInstructionTargets(ctx, config, requested)
+      sendJson(res, 200, {
+        ok: true,
+        target: loaded.target,
+        workspaceDir: loaded.workspaceDir ?? null,
+        configuredWorkspaceDir: config.workspaceDir,
+        workspaces: loaded.workspaces,
+      })
+      return
+    }
+
+    if (pathname === '/dsh-additive/instructions/global') {
+      if (method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      const body = await readJsonBody(req)
+      const snapshot = await writeTarget(ctx, config, 'global', undefined, body)
+      ctx.logger?.info(`[additive] 全局指令文件已写入: ${snapshot.path} (${snapshot.bytes}B)`)
+      sendJson(res, 200, { ok: true, target: { global: snapshot } })
+      return
+    }
+
+    if (pathname === '/dsh-additive/instructions/local') {
+      if (method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      const body = await readJsonBody(req)
+      const requested = url.searchParams.get('workspace') ?? undefined
+      const snapshot = await writeTarget(ctx, config, 'local', requested, body)
+      ctx.logger?.info(
+        `[additive] 工作区指令文件已写入: ${snapshot.path} (${snapshot.bytes}B)`,
+      )
+      sendJson(res, 200, { ok: true, target: { local: snapshot } })
+      return
+    }
+
+    sendJson(res, 404, { ok: false, error: 'not-found' })
+  } catch (error) {
+    if (error instanceof InstructionStoreError) {
+      const status =
+        error.code === 'not-found'
+          ? 404
+          : error.code === 'conflict'
+            ? 409
+            : error.code === 'too-large'
+              ? 413
+              : error.code === 'not-a-directory'
+                ? 400
+                : 400
+      sendJson(res, status, { ok: false, error: error.code, message: error.message })
+      return
+    }
+    ctx.logger?.warn(`[additive] 指令文件请求失败: ${String(error)}`)
     sendJson(res, 500, { ok: false, error: 'internal' })
   }
 }

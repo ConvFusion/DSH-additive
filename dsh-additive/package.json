@@ -1,7 +1,7 @@
 {
   "name": "dsh-additive",
-  "version": "0.1.3",
-  "description": "DSH Additive — a small plugin bundle: custom sidebar logo/brand-name, and ↑/↓ input-history navigation for the Web chat composer.",
+  "version": "0.1.4",
+  "description": "DSH Additive — a small plugin bundle: custom sidebar logo/brand-name, ↑/↓ input-history navigation for the Web chat composer, and settings-page editing of the global/workspace AGENTS instruction files.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -24,6 +24,7 @@
     "build": "npm run build:host && npm run build:client",
     "build:host": "tsc -p tsconfig.json",
     "build:client": "node scripts/build-client.mjs && tsc -p tsconfig.client.json",
+    "smoke:instructions": "node scripts/smoke-instructions.mjs",
     "clean": "rm -rf lib"
   },
   "dependencies": {

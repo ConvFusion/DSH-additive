@@ -47,6 +47,8 @@ const DEFAULT_BRAND_VERSION = 'Launcher'
 /** Host-persisted config (settings document, mirrored to the browser). */
 interface InputHistoryConfig {
   inputHistoryEnabled: boolean
+  /** Workspace directory whose AGENTS.local.md the instructions editor targets. */
+  workspaceDir: string
 }
 
 /** Client-local brand state (browser localStorage). */
@@ -155,9 +157,12 @@ export function apply(ctx: {
 function readHistoryConfig(scope: SettingsScope): InputHistoryConfig {
   const snap = scope.getSnapshot()
   if (snap.status !== 'ready' || !snap.value) {
-    return { inputHistoryEnabled: false }
+    return { inputHistoryEnabled: false, workspaceDir: '' }
   }
-  return { inputHistoryEnabled: !!snap.value.inputHistoryEnabled }
+  return {
+    inputHistoryEnabled: !!snap.value.inputHistoryEnabled,
+    workspaceDir: (snap.value.workspaceDir ?? '').trim(),
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -333,10 +338,345 @@ function useBrand(brand: BrandStore): BrandState {
   return brand.get()
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ * AGENTS instruction files — the host owns the two files, the browser edits
+ * their content over the same-origin /dsh-additive/instructions routes.
+ *
+ *   global → $DSH_HOME/AGENTS.md          (loaded for every session)
+ *   local  → <workspace>/AGENTS.local.md  (project overlay)
+ *
+ * The core `agent-instructions` plugin decides *which* files load and is not
+ * configurable from settings; this editor only reads and writes their bytes.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+interface InstructionFileSnapshot {
+  id: 'global' | 'local'
+  path: string
+  displayPath: string
+  exists: boolean
+  content: string
+  bytes: number
+  sha256: string | null
+  mtimeMs: number | null
+}
+
+interface WorkspaceSummary {
+  id: string
+  title: string
+  path: string
+  missingDir: boolean
+}
+
+interface InstructionsPayload {
+  ok?: boolean
+  error?: string
+  message?: string
+  target?: { global?: InstructionFileSnapshot; local?: InstructionFileSnapshot | null }
+  workspaceDir?: string | null
+  configuredWorkspaceDir?: string
+  workspaces?: WorkspaceSummary[]
+}
+
+interface InstructionsState {
+  /** Which file the dropdown selected: the global one, or a workspace overlay. */
+  selection: 'global' | 'local'
+  /** Workspace file path; `null` when a workspace file is not resolvable yet. */
+  localPath: string | null
+  workspaces: WorkspaceSummary[]
+  loading: boolean
+  draft: string
+  saved: InstructionFileSnapshot | null
+  saving: boolean
+  error: string | null
+}
+
+interface InstructionsEditor extends InstructionsState {
+  /** `''` selects the global file; anything else is a workspace directory. */
+  select: (value: string) => void
+  setDraft: (value: string) => void
+  save: () => Promise<void>
+  reload: () => Promise<void>
+}
+
+const GLOBAL_FILE_LABEL = '全局指令（所有会话）'
+/** `<select>` value that stands for the workspace-local file of directory `dir`. */
+const WORKSPACE_OPTION_PREFIX = 'workspace:'
+
+function workspaceOptionValue(dir: string): string {
+  return WORKSPACE_OPTION_PREFIX + dir
+}
+
+function emptyInstructionsState(): InstructionsState {
+  return {
+    selection: 'global',
+    localPath: null,
+    workspaces: [],
+    loading: true,
+    draft: '',
+    saved: null,
+    saving: false,
+    error: null,
+  }
+}
+
+function useInstructionsEditor(scope: SettingsScope): InstructionsEditor {
+  const [state, setState] = React.useState<InstructionsState>(emptyInstructionsState)
+  /** Explicit workspace override this browser session; `''` means global. */
+  const requestedRef = React.useRef<'' | string>('')
+  /** Draft edited in the browser — it must survive background reloads. */
+  const dirtyRef = React.useRef(false)
+
+  const load = React.useCallback(async (): Promise<void> => {
+    setState((prev) => ({ ...prev, loading: true }))
+    try {
+      const requested = requestedRef.current
+      const url = requested
+        ? `/dsh-additive/instructions?workspace=${encodeURIComponent(requested)}`
+        : '/dsh-additive/instructions'
+      const res = await fetch(url)
+      const data = (await res.json().catch(() => null)) as InstructionsPayload | null
+      if (!res.ok || !data?.ok || !data.target?.global) {
+        throw new Error(data?.message || `读取失败（HTTP ${res.status}）`)
+      }
+      setState((prev) => {
+        const snapshot =
+          prev.selection === 'global' ? (data.target?.global ?? null) : (data.target?.local ?? null)
+        const localPath = data.target?.local?.path ?? null
+        const next: InstructionsState = {
+          ...prev,
+          loading: false,
+          workspaces: data.workspaces ?? [],
+          saved: snapshot,
+          localPath,
+          error: null,
+        }
+        if (snapshot && !dirtyRef.current) next.draft = snapshot.content
+        return next
+      })
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      setState((prev) => ({ ...prev, loading: false, error: message }))
+    }
+  }, [])
+
+  React.useEffect(() => {
+    void load()
+  }, [load])
+
+  const select = (value: string): void => {
+    const isGlobal = value === ''
+    requestedRef.current = isGlobal ? '' : value
+    dirtyRef.current = false
+    setState((prev) => ({
+      ...prev,
+      selection: isGlobal ? 'global' : 'local',
+      draft: '',
+      error: null,
+    }))
+    if (!isGlobal) {
+      // Remember the picked workspace; the global file needs no such setting.
+      void Promise.resolve(scope.set('workspaceDir', value)).catch(() => {})
+    }
+    void load()
+  }
+
+  const setDraft = (value: string): void => {
+    dirtyRef.current = true
+    setState((prev) => ({ ...prev, draft: value }))
+  }
+
+  const save = async (): Promise<void> => {
+    const { selection, localPath, saved, draft } = state
+    if (selection === 'local' && !localPath) return
+    setState((prev) => ({ ...prev, saving: true }))
+    try {
+      const query =
+        selection === 'local' && localPath ? `?workspace=${encodeURIComponent(localPath)}` : ''
+      const res = await fetch(`/dsh-additive/instructions/${selection}${query}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: draft,
+          // Guard against clobbering an edit made outside this page; a file
+          // that did not exist yet sends null and is created on save.
+          baseSha256: saved?.sha256 ?? null,
+        }),
+      })
+      const data = (await res.json().catch(() => null)) as InstructionsPayload | null
+      if (!res.ok || !data?.ok) {
+        throw new Error(
+          data?.error === 'conflict'
+            ? '磁盘上的文件已被外部修改，请先「重新加载」再保存'
+            : data?.message || `保存失败（HTTP ${res.status}）`,
+        )
+      }
+      const written = selection === 'global' ? data.target?.global : data.target?.local
+      dirtyRef.current = false
+      setState((prev) => ({
+        ...prev,
+        saved: written ?? prev.saved,
+        draft: written?.content ?? prev.draft,
+        saving: false,
+        error: null,
+      }))
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      setState((prev) => ({ ...prev, saving: false, error: message }))
+    }
+  }
+
+  const reload = async (): Promise<void> => {
+    dirtyRef.current = false
+    await load()
+  }
+
+  return { ...state, select, setDraft, save, reload }
+}
+
+/** One variable-height textarea row's shared geometry. */
+const INSTRUCTION_TEXTAREA: React.CSSProperties = {
+  boxSizing: 'border-box',
+  width: '100%',
+  minHeight: 260,
+  resize: 'vertical',
+  border: '1px solid #d0d7de',
+  borderRadius: 6,
+  padding: '6px 8px',
+  fontSize: 12,
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  lineHeight: 1.5,
+  background: '#fff',
+}
+
+const BUTTON_PRIMARY: React.CSSProperties = {
+  border: '1px solid #0969da',
+  background: '#0969da',
+  color: '#fff',
+  borderRadius: 6,
+  padding: '3px 10px',
+  fontSize: 12,
+}
+
+const BUTTON_SECONDARY: React.CSSProperties = {
+  border: '1px solid #d0d7de',
+  background: '#fff',
+  color: '#24292f',
+  borderRadius: 6,
+  padding: '3px 10px',
+  fontSize: 12,
+}
+
+function instructionStatusLabel(snapshot: InstructionFileSnapshot | null): string {
+  if (!snapshot) return '未知'
+  return snapshot.exists ? `已存在 · ${snapshot.bytes} 字节` : '尚不存在（保存即创建）'
+}
+
+function InstructionsEditorPanel(props: { editor: InstructionsEditor }): React.ReactElement {
+  const {
+    selection,
+    localPath,
+    workspaces,
+    loading,
+    draft,
+    saved,
+    saving,
+    error,
+    select,
+    setDraft,
+    save,
+    reload,
+  } = props.editor
+
+  const dirty = !!saved && draft !== saved.content
+  const selectedValue = selection === 'global' ? '' : workspaceOptionValue(localPath ?? '')
+  const knownWorkspace = workspaces.some((entry) => entry.path === localPath)
+  const noWorkspace = selection === 'local' && !localPath
+
+  return (
+    <div style={STYLES.group}>
+      <div style={STYLES.groupHead}>
+        <span style={STYLES.groupTitle}>AGENTS 指令文件</span>
+      </div>
+      <div style={STYLES.groupBody}>
+        <div style={{ ...STYLES.row, gridTemplateColumns: '200px 1fr' }}>
+          <div style={STYLES.label}>选择文件</div>
+          <div style={{ minWidth: 0 }}>
+            <select
+              style={{ ...STYLES.input, maxWidth: 560 }}
+              value={selectedValue}
+              onChange={(e) => {
+                const picked = e.target.value
+                select(
+                  picked.startsWith(WORKSPACE_OPTION_PREFIX)
+                    ? picked.slice(WORKSPACE_OPTION_PREFIX.length)
+                    : '',
+                )
+              }}
+            >
+              <option value="">{GLOBAL_FILE_LABEL}</option>
+              {workspaces.map((entry) => (
+                <option key={entry.id} value={workspaceOptionValue(entry.path)}>
+                  {entry.missingDir ? `⚠ ${entry.title}（目录不存在）` : entry.title} —{' '}
+                  {entry.path}
+                </option>
+              ))}
+              {!knownWorkspace && localPath && (
+                <option value={workspaceOptionValue(localPath)}>{localPath}</option>
+              )}
+            </select>
+          </div>
+        </div>
+
+        <div style={{ padding: '8px 0', borderTop: '1px solid #eaeef2' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
+            <span style={{ ...STYLES.metaLine, wordBreak: 'break-all' }}>
+              {saved ? `${saved.displayPath} · ${instructionStatusLabel(saved)}` : '未加载'}
+            </span>
+            {dirty && <span style={{ fontSize: 11, color: '#0969da' }}>● 未保存</span>}
+            {loading && <span style={STYLES.metaLine}>读取中…</span>}
+          </div>
+          <textarea
+            style={INSTRUCTION_TEXTAREA}
+            spellCheck={false}
+            value={draft}
+            placeholder={selection === 'global' ? 'AGENTS.md' : 'AGENTS.local.md'}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+            <button
+              type="button"
+              onClick={() => void save()}
+              disabled={!dirty || saving || noWorkspace}
+              style={{ ...BUTTON_PRIMARY, opacity: !dirty || saving || noWorkspace ? 0.55 : 1 }}
+            >
+              {saving ? '保存中…' : '保存'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void reload()}
+              disabled={saving}
+              style={{ ...BUTTON_SECONDARY, cursor: saving ? 'default' : 'pointer' }}
+            >
+              重新加载
+            </button>
+          </div>
+          {noWorkspace && (
+            <div style={{ fontSize: 11, color: '#9a6700', marginTop: 4 }}>
+              没有可用的工作区。
+            </div>
+          )}
+          {error && <div style={{ fontSize: 11, color: '#cf222e', marginTop: 4 }}>{error}</div>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function AdditiveSettingsSection(props: SectionProps): React.ReactElement {
   const { scope, brand } = props
   const history = useHistoryConfig(scope)
   const brandState = useBrand(brand)
+  const instructions = useInstructionsEditor(scope)
   const [uploadError, setUploadError] = React.useState<string | null>(null)
   const [uploading, setUploading] = React.useState(false)
   const fileRef = React.useRef<HTMLInputElement | null>(null)
@@ -515,6 +855,9 @@ function AdditiveSettingsSection(props: SectionProps): React.ReactElement {
           )}
         </div>
       </div>
+
+      {/* ── AGENTS instruction files ─────────────────────────────── */}
+      <InstructionsEditorPanel editor={instructions} />
     </div>
   )
 }
