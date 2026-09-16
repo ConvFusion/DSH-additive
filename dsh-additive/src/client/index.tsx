@@ -380,8 +380,8 @@ interface InstructionsPayload {
 interface InstructionsState {
   /** Which file the dropdown selected: the global one, or a workspace overlay. */
   selection: 'global' | 'local'
-  /** Workspace file path; `null` when a workspace file is not resolvable yet. */
-  localPath: string | null
+  /** Workspace directory for the overlay file; `null` when none is selected/resolvable. */
+  workspaceDir: string | null
   workspaces: WorkspaceSummary[]
   loading: boolean
   draft: string
@@ -409,7 +409,7 @@ function workspaceOptionValue(dir: string): string {
 function emptyInstructionsState(): InstructionsState {
   return {
     selection: 'global',
-    localPath: null,
+    workspaceDir: null,
     workspaces: [],
     loading: true,
     draft: '',
@@ -441,13 +441,17 @@ function useInstructionsEditor(scope: SettingsScope): InstructionsEditor {
       setState((prev) => {
         const snapshot =
           prev.selection === 'global' ? (data.target?.global ?? null) : (data.target?.local ?? null)
-        const localPath = data.target?.local?.path ?? null
+        // The host resolves the effective directory (requested ? configured ?
+        // first registered) and echoes it back; the snapshot's `path` is the
+        // FILE it resolved (…/AGENTS.local.md), which must NOT be sent back as
+        // a workspace directory on save.
+        const workspaceDir = data.workspaceDir ?? null
         const next: InstructionsState = {
           ...prev,
           loading: false,
           workspaces: data.workspaces ?? [],
           saved: snapshot,
-          localPath,
+          workspaceDir,
           error: null,
         }
         if (snapshot && !dirtyRef.current) next.draft = snapshot.content
@@ -486,12 +490,12 @@ function useInstructionsEditor(scope: SettingsScope): InstructionsEditor {
   }
 
   const save = async (): Promise<void> => {
-    const { selection, localPath, saved, draft } = state
-    if (selection === 'local' && !localPath) return
+    const { selection, workspaceDir, saved, draft } = state
+    if (selection === 'local' && !workspaceDir) return
     setState((prev) => ({ ...prev, saving: true }))
     try {
       const query =
-        selection === 'local' && localPath ? `?workspace=${encodeURIComponent(localPath)}` : ''
+        selection === 'local' && workspaceDir ? `?workspace=${encodeURIComponent(workspaceDir)}` : ''
       const res = await fetch(`/dsh-additive/instructions/${selection}${query}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -574,7 +578,7 @@ function instructionStatusLabel(snapshot: InstructionFileSnapshot | null): strin
 function InstructionsEditorPanel(props: { editor: InstructionsEditor }): React.ReactElement {
   const {
     selection,
-    localPath,
+    workspaceDir,
     workspaces,
     loading,
     draft,
@@ -588,9 +592,9 @@ function InstructionsEditorPanel(props: { editor: InstructionsEditor }): React.R
   } = props.editor
 
   const dirty = !!saved && draft !== saved.content
-  const selectedValue = selection === 'global' ? '' : workspaceOptionValue(localPath ?? '')
-  const knownWorkspace = workspaces.some((entry) => entry.path === localPath)
-  const noWorkspace = selection === 'local' && !localPath
+  const selectedValue = selection === 'global' ? '' : workspaceOptionValue(workspaceDir ?? '')
+  const knownWorkspace = workspaces.some((entry) => entry.path === workspaceDir)
+  const noWorkspace = selection === 'local' && !workspaceDir
 
   return (
     <div style={STYLES.group}>
@@ -620,8 +624,8 @@ function InstructionsEditorPanel(props: { editor: InstructionsEditor }): React.R
                   {entry.path}
                 </option>
               ))}
-              {!knownWorkspace && localPath && (
-                <option value={workspaceOptionValue(localPath)}>{localPath}</option>
+              {!knownWorkspace && workspaceDir && (
+                <option value={workspaceOptionValue(workspaceDir)}>{workspaceDir}</option>
               )}
             </select>
           </div>
