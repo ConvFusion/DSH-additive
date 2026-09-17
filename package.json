@@ -1,6 +1,6 @@
 {
   "name": "dsh-additive",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "DSH Additive — a small plugin bundle: custom sidebar logo/brand-name, ↑/↓ input-history navigation for the Web chat composer, and settings-page editing of the global/workspace AGENTS instruction files.",
   "type": "module",
   "main": "lib/index.js",
@@ -42,8 +42,8 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-home-paths": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-settings": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-settings": "0.1.5-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.1",

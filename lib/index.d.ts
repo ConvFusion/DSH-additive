@@ -30,7 +30,6 @@ import { Config, type Config as ConfigShape } from './config.js';
 import { type LogoStore } from './logo-store.js';
 export declare const name = "dsh-additive";
 export { Config };
-export declare const inject: string[];
 export declare function apply(ctx: Context, entry?: Partial<ConfigShape>): void;
 /** Route handler (exported for tests). Dispatches on method + pathname. */
 export declare function handleLogoRequest(req: IncomingMessage, res: ServerResponse, store: LogoStore, logger: {

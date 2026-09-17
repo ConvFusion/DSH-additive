@@ -26,7 +26,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type Context } from '@deepseek-ai/cordis'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import { Config, DEFAULT_CONFIG, type Config as ConfigShape } from './config.js'
 import {
   createLogoStore,
@@ -62,22 +62,27 @@ import {
 export const name = 'dsh-additive'
 export { Config }
 
-export const inject = ['settings']
-
 export function apply(ctx: Context, entry: Partial<ConfigShape> = {}): void {
   const merged: ConfigShape = { ...DEFAULT_CONFIG, ...entry }
 
   // Settings plane: schema defaults < composition (cordis.patch.yml) < user
   // document (~/.dsh/settings.yaml). The browser reads the same namespace
   // through the settings mirror.
+  //
+  // DSH 0.1.5-rc.1 removed installSettingsSection/settingsNamespace from
+  // @deepseek-ai/dsh-settings; the equivalent is the SettingsProvider service's
+  // installSection, reached through ctx.inject(["settings"], ...).
   let source: () => ConfigShape = () => merged
-  installSettingsSection(ctx, settingsNamespace('additive'), Config, merged, {
-    setSource: (get) => {
-      source = get
-    },
-    onChange: () => {
-      void source
-    },
+  ctx.inject(['settings'], (settingsCtx) => {
+    const settings: SettingsProvider = settingsCtx.settings
+    settings.installSection(ctx, 'additive', Config, merged, {
+      setSource: (get) => {
+        source = get
+      },
+      onChange: () => {
+        void source
+      },
+    })
   })
 
   void registerRoutes(ctx, () => source())
