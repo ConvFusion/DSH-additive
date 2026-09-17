@@ -14,10 +14,15 @@
  *       GET  /dsh-additive/instructions/workspaces  — registered workspaces for the picker
  *       POST /dsh-additive/instructions/global      — write $DSH_HOME/AGENTS.md
  *       POST /dsh-additive/instructions/local       — write <workspace>/AGENTS.local.md
+ *   - same-origin web routes for the Python environment (see ./python-env.ts):
+ *       GET  /dsh-additive/python-env               — resolve the env (config > system > DSH venv)
+ *       POST /dsh-additive/python-env/install       — create-or-reuse the $DSH_HOME/python-env venv
+ *       POST /dsh-additive/python-env/agents        — (re)write the managed block into AGENTS.md
  *
  * The image bytes live under the DSH home (e.g. ~/.dsh/dsh-additive/); the
  * browser only ever sees the served path. The instruction editor touches
- * exactly two existing files (see ./instructions-store.ts) and nothing else.
+ * exactly two existing files (see ./instructions-store.ts) and nothing else;
+ * the Python-env surface records one managed block into $DSH_HOME/AGENTS.md.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type Context } from '@deepseek-ai/cordis'
@@ -44,6 +49,15 @@ import {
   type InstructionFileSnapshot,
   type WorkspaceSummary,
 } from './instructions-store.js'
+import {
+  dshVenvStatus,
+  ensureVenv,
+  PythonEnvError,
+  resolvePythonEnv,
+  writePythonEnvToAgents,
+  type DshVenvStatus,
+  type PythonEnvInfo,
+} from './python-env.js'
 
 export const name = 'dsh-additive'
 export { Config }
@@ -93,6 +107,13 @@ async function registerRoutes(ctx: Context, readConfig: () => ConfigShape): Prom
     path: '/dsh-additive',
     handler: (req: IncomingMessage, res: ServerResponse) => {
       const pathname = new URL(req.url ?? '/', 'http://localhost').pathname.replace(/\/+$/, '') || '/'
+      if (pathname.startsWith('/dsh-additive/python-env')) {
+        void handlePythonEnvRequest(req, res, readConfig, ctx).catch((error: unknown) => {
+          ctx.logger?.warn(`[additive] Python 环境请求处理失败: ${String(error)}`)
+          sendJson(res, 500, { ok: false, error: 'internal' })
+        })
+        return
+      }
       if (pathname.startsWith('/dsh-additive/instructions')) {
         void handleInstructionsRequest(req, res, readConfig, ctx).catch((error: unknown) => {
           ctx.logger?.warn(`[additive] 指令文件请求处理失败: ${String(error)}`)
@@ -104,7 +125,7 @@ async function registerRoutes(ctx: Context, readConfig: () => ConfigShape): Prom
     },
   })
   ctx.logger?.info(
-    `[additive] logo 本地存储已就绪（${store.dir}），路由 ${LOGO_SERVED_PATH} 与 /dsh-additive/instructions* 已注册`,
+    `[additive] logo 本地存储已就绪（${store.dir}），路由 ${LOGO_SERVED_PATH}、/dsh-additive/instructions* 与 /dsh-additive/python-env* 已注册`,
   )
 }
 
@@ -434,6 +455,104 @@ export async function handleInstructionsRequest(
       return
     }
     ctx.logger?.warn(`[additive] 指令文件请求失败: ${String(error)}`)
+    sendJson(res, 500, { ok: false, error: 'internal' })
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Python-environment routes (Settings → Additive → Python 环境)
+ *
+ *   GET  /dsh-additive/python-env              — read-only resolution:
+ *                                                config.pythonPath > system > DSH venv
+ *   POST /dsh-additive/python-env/install      — create-or-reuse the one-shot
+ *                                                $DSH_HOME/python-env venv
+ *   POST /dsh-additive/python-env/agents       — resolve (installing the venv
+ *                                                if nothing resolvable exists)
+ *                                                and write the managed block
+ *                                                into $DSH_HOME/AGENTS.md
+ *
+ * The venv is created only when missing, so repeated actions never re-install
+ * Python. All host-side logic lives in ./python-env.ts.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** Route handler for `/dsh-additive/python-env*` (exported for tests). */
+export async function handlePythonEnvRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  readConfig: () => ConfigShape,
+  ctx: InstructionsHostContext,
+): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const pathname = url.pathname.replace(/\/+$/, '') || '/'
+  const method = req.method ?? 'GET'
+  const config = readConfig()
+
+  try {
+    if (pathname === '/dsh-additive/python-env') {
+      if (method !== 'GET') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      const info = resolvePythonEnv(config)
+      const venv = dshVenvStatus()
+      // A `missing` status with no existing DSH venv is the "needs install" case.
+      const needsInstall = info.status === 'missing' && !venv.exists
+      sendJson(res, 200, {
+        ok: true,
+        info,
+        venv,
+        needsInstall,
+        pythonPath: config.pythonPath,
+      })
+      return
+    }
+
+    if (pathname === '/dsh-additive/python-env/install') {
+      if (method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      const ensured = ensureVenv()
+      ctx.logger?.info(
+        `[additive] Python 虚拟环境${ensured.installed ? '已创建' : '已存在'}: ${ensured.python}`,
+      )
+      sendJson(res, 200, { ok: true, ...ensured })
+      return
+    }
+
+    if (pathname === '/dsh-additive/python-env/agents') {
+      if (method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+        return
+      }
+      // Resolve; when nothing is resolvable, install the one-shot DSH venv so
+      // the recorded environment is always a usable path.
+      let info: PythonEnvInfo = resolvePythonEnv(config)
+      if (info.status === 'missing') {
+        const ensured = ensureVenv()
+        info = {
+          status: 'configured',
+          kind: 'dsh-venv',
+          path: ensured.python,
+          version: ensured.version,
+          description: `DSH 自动安装的虚拟环境（${ensured.installed ? '已创建' : '已存在'}）`,
+        }
+      }
+      const result = await writePythonEnvToAgents(info)
+      ctx.logger?.info(
+        `[additive] Python 环境已写入 ${result.displayPath}（${result.replaced ? '替换标记块' : '追加标记块'}）→ ${result.path}`,
+      )
+      sendJson(res, 200, { ok: true, ...result })
+      return
+    }
+
+    sendJson(res, 404, { ok: false, error: 'not-found' })
+  } catch (error) {
+    if (error instanceof PythonEnvError) {
+      sendJson(res, 400, { ok: false, error: error.code, message: error.message })
+      return
+    }
+    ctx.logger?.warn(`[additive] Python 环境请求失败: ${String(error)}`)
     sendJson(res, 500, { ok: false, error: 'internal' })
   }
 }

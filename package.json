@@ -25,6 +25,7 @@
     "build:host": "tsc -p tsconfig.json",
     "build:client": "node scripts/build-client.mjs && tsc -p tsconfig.client.json",
     "smoke:instructions": "node scripts/smoke-instructions.mjs",
+    "smoke:python-env": "node scripts/smoke-python-env.mjs",
     "clean": "rm -rf lib"
   },
   "peerDependencies": {

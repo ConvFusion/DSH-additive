@@ -1,12 +1,11 @@
 # dependencies
 node_modules/
 
-# build output (dsh-additive: `npm run build` regenerates)
-dsh-additive/lib/
-
-# OS / editor cruft
-.DS_Store
-*.log
-
-# pnpm local store (sandbox falls back to project-local store)
+# 本地构建缓存 / 临时产物
 .pnpm-store/
+*.log
+.DS_Store
+
+# 注意：lib/（构建产物）有意提交入库，使 `dsh plugin add <git-url>` 直接装到
+# 可加载的插件 —— 与 dsh-convfusion 参考布局一致。改 src/ 后跑 `npm run build`
+# 并连同 lib/ 一起提交。

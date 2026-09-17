@@ -49,6 +49,8 @@ interface InputHistoryConfig {
   inputHistoryEnabled: boolean
   /** Workspace directory whose AGENTS.local.md the instructions editor targets. */
   workspaceDir: string
+  /** Optional explicit Python interpreter / venv directory; empty auto-detects. */
+  pythonPath: string
 }
 
 /** Client-local brand state (browser localStorage). */
@@ -157,11 +159,12 @@ export function apply(ctx: {
 function readHistoryConfig(scope: SettingsScope): InputHistoryConfig {
   const snap = scope.getSnapshot()
   if (snap.status !== 'ready' || !snap.value) {
-    return { inputHistoryEnabled: false, workspaceDir: '' }
+    return { inputHistoryEnabled: false, workspaceDir: '', pythonPath: '' }
   }
   return {
     inputHistoryEnabled: !!snap.value.inputHistoryEnabled,
     workspaceDir: (snap.value.workspaceDir ?? '').trim(),
+    pythonPath: (snap.value.pythonPath ?? '').trim(),
   }
 }
 
@@ -537,6 +540,231 @@ function useInstructionsEditor(scope: SettingsScope): InstructionsEditor {
   return { ...state, select, setDraft, save, reload }
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ * Python environment — the host resolves the env (config > system > the one
+ * shot DSH venv), optionally creates the venv, and writes the managed block
+ * into $DSH_HOME/AGENTS.md over the same-origin /dsh-additive/python-env
+ * routes. The browser only shows status and offers the two actions.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+interface PythonEnvInfo {
+  status: 'configured' | 'system' | 'missing'
+  kind: string
+  path: string | null
+  version: string | null
+  description: string
+}
+
+interface DshVenvStatus {
+  dir: string
+  exists: boolean
+  python: string | null
+}
+
+interface PythonEnvPayload {
+  ok?: boolean
+  error?: string
+  message?: string
+  info?: PythonEnvInfo
+  venv?: DshVenvStatus
+  needsInstall?: boolean
+  pythonPath?: string
+  installed?: boolean
+  /** The venv interpreter path (install response). */
+  python?: string
+  /** The recorded interpreter/venv path (write-AGENTS response). */
+  path?: string
+  agentsPath?: string
+  displayPath?: string
+  replaced?: boolean
+}
+
+interface PythonEnvState {
+  env: PythonEnvInfo | null
+  venv: DshVenvStatus | null
+  loading: boolean
+  busy: boolean
+  /** True while the "install" or "write to AGENTS.md" action is in flight. */
+  action: 'install' | 'agents' | null
+  message: string | null
+  error: string | null
+}
+
+interface PythonEnvPanelApi {
+  detect: () => Promise<void>
+  install: () => Promise<void>
+  writeAgents: () => Promise<void>
+}
+
+function emptyPythonEnvState(): PythonEnvState {
+  return {
+    env: null,
+    venv: null,
+    loading: true,
+    busy: false,
+    action: null,
+    message: null,
+    error: null,
+  }
+}
+
+function usePythonEnv(pythonPath: string): PythonEnvPanelApi & PythonEnvState {
+  const [state, setState] = React.useState<PythonEnvState>(emptyPythonEnvState)
+
+  const detect = React.useCallback(async (): Promise<void> => {
+    setState((prev) => ({ ...prev, loading: true, error: null, message: null }))
+    try {
+      const res = await fetch('/dsh-additive/python-env')
+      const data = (await res.json().catch(() => null)) as PythonEnvPayload | null
+      if (!res.ok || !data?.ok || !data.info) {
+        throw new Error(data?.message || `读取失败（HTTP ${res.status}）`)
+      }
+      setState((prev) => ({
+        ...prev,
+        loading: false,
+        env: data.info ?? null,
+        venv: data.venv ?? null,
+      }))
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      setState((prev) => ({ ...prev, loading: false, error: message }))
+    }
+  }, [])
+
+  // Re-resolve whenever the configured pythonPath changes (the hook re-runs
+  // its effect through the parent on that field's commit).
+  const lastPathRef = React.useRef(pythonPath)
+  React.useEffect(() => {
+    void detect()
+  }, [detect, pythonPath])
+
+  const install = React.useCallback(async (): Promise<void> => {
+    setState((prev) => ({ ...prev, action: 'install', error: null, message: null }))
+    try {
+      const res = await fetch('/dsh-additive/python-env/install', { method: 'POST' })
+      const data = (await res.json().catch(() => null)) as PythonEnvPayload | null
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.message || `安装失败（HTTP ${res.status}）`)
+      }
+      const note = data.installed ? '已创建' : '已存在（未重复安装）'
+      setState((prev) => ({
+        ...prev,
+        action: null,
+        message: `虚拟环境${note}：${data.python}`,
+      }))
+      await detect()
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      setState((prev) => ({ ...prev, action: null, error: message }))
+    }
+  }, [detect])
+
+  const writeAgents = React.useCallback(async (): Promise<void> => {
+    setState((prev) => ({ ...prev, action: 'agents', error: null, message: null }))
+    try {
+      const res = await fetch('/dsh-additive/python-env/agents', { method: 'POST' })
+      const data = (await res.json().catch(() => null)) as PythonEnvPayload | null
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.message || `写入失败（HTTP ${res.status}）`)
+      }
+      const mode = data.replaced ? '已更新' : '已追加'
+      setState((prev) => ({
+        ...prev,
+        action: null,
+        message: `Python 环境${mode}写入 ${data.displayPath ?? data.agentsPath}：${data.path}`,
+      }))
+      await detect()
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      setState((prev) => ({ ...prev, action: null, error: message }))
+    }
+  }, [detect])
+
+  return { ...state, detect, install, writeAgents }
+}
+
+function pythonStatusLabel(env: PythonEnvInfo | null): string {
+  if (!env) return '未知'
+  switch (env.status) {
+    case 'configured':
+      return '用户指定'
+    case 'system':
+      return '系统 Python'
+    case 'missing':
+      return '未检测到'
+    default:
+      return env.status
+  }
+}
+
+function PythonEnvPanel(props: {
+  scope: SettingsScope
+  pythonPath: string
+}): React.ReactElement {
+  const { scope, pythonPath } = props
+  const pyenv = usePythonEnv(pythonPath)
+  const { env, venv, loading, action, message, error } = pyenv
+  const statusText = env ? `${pythonStatusLabel(env)} · ${env.path ?? '（未解析）'}` : '未知'
+
+  const showInstall = env ? env.status === 'missing' : !venv?.exists
+  return (
+    <div style={STYLES.group}>
+      <div style={STYLES.groupHead}>
+        <span style={STYLES.groupTitle}>Python 环境</span>
+      </div>
+      <div style={STYLES.groupBody}>
+        <div style={STYLES.row}>
+          <div style={STYLES.label}>Python 路径</div>
+          <div>
+            <input
+              style={{ ...STYLES.input, maxWidth: 420 }}
+              type="text"
+              placeholder="留空 = 自动检测"
+              value={pythonPath}
+              onChange={(e) => {
+                const v = e.target.value
+                void Promise.resolve(scope.set('pythonPath', v)).catch(() => {})
+              }}
+            />
+          </div>
+        </div>
+
+        <div style={{ padding: '8px 0', borderTop: '1px solid #eaeef2' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={STYLES.metaLine}>
+              {loading ? '解析中…' : `状态：${statusText}`}
+              {env?.version ? ` · ${env.version}` : ''}
+            </span>
+            {showInstall && (
+              <button
+                type="button"
+                onClick={() => void pyenv.install()}
+                disabled={action !== null || loading}
+                style={{ ...BUTTON_PRIMARY, opacity: action || loading ? 0.55 : 1 }}
+              >
+                {action === 'install' ? '安装中…' : '安装虚拟环境'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void pyenv.writeAgents()}
+              disabled={action !== null || loading}
+              style={{
+                ...BUTTON_SECONDARY,
+                cursor: action || loading ? 'default' : 'pointer',
+              }}
+            >
+              {action === 'agents' ? '写入中…' : '写入 AGENTS.md'}
+            </button>
+          </div>
+          {message && <div style={{ ...STYLES.metaLine, color: '#0969da', marginTop: 4 }}>{message}</div>}
+          {error && <div style={{ fontSize: 11, color: '#cf222e', marginTop: 4 }}>{error}</div>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /** One variable-height textarea row's shared geometry. */
 const INSTRUCTION_TEXTAREA: React.CSSProperties = {
   boxSizing: 'border-box',
@@ -859,6 +1087,12 @@ function AdditiveSettingsSection(props: SectionProps): React.ReactElement {
           )}
         </div>
       </div>
+
+      {/* ── Python environment ─────────────────────────────────────── */}
+      <PythonEnvPanel
+        scope={scope}
+        pythonPath={history.pythonPath}
+      />
 
       {/* ── AGENTS instruction files ─────────────────────────────── */}
       <InstructionsEditorPanel editor={instructions} />
