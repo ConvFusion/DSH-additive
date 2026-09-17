@@ -6,6 +6,10 @@ node_modules/
 *.log
 .DS_Store
 
+# 本地开发文档与计划（插件运行不需要，不随仓库分发；scripts/ 是构建与验证工具，需提交）
+/dev-notes/
+/plan_*.md
+
 # 注意：lib/（构建产物）有意提交入库，使 `dsh plugin add <git-url>` 直接装到
 # 可加载的插件 —— 与 dsh-convfusion 参考布局一致。改 src/ 后跑 `npm run build`
 # 并连同 lib/ 一起提交。

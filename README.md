@@ -18,9 +18,6 @@ DSH 界面增强插件（`~/.dsh/profiles/web` 本地 link 安装）：
    **不重复安装**）。「写入 AGENTS.md」把解析出的环境以**标记块**追加/更新到
    全局 `$DSH_HOME/AGENTS.md`（块内由插件维护，不碰用户手写内容）。
 
-> 开发计划见仓库根目录 `plan_logo.md` / `plan_history_inputs.md`；
-> 指令文件编辑的实现说明见 `dev-notes/instructions-editor.md`。
-
 ## 安装
 
 ### 从 GitHub 安装（推荐）
